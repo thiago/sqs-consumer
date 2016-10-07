@@ -58,6 +58,7 @@ function Consumer(options) {
   this.messageAttributeNames = options.messageAttributeNames || [];
   this.stopped = true;
   this.batchSize = options.batchSize || 1;
+  this.callEachBatchItem = options.callEachBatchItem !== false;
   this.visibilityTimeout = options.visibilityTimeout;
   this.waitTimeSeconds = options.waitTimeSeconds || 20;
   this.authenticationErrorTimeout = options.authenticationErrorTimeout || 10000;
@@ -127,7 +128,11 @@ Consumer.prototype._handleSqsResponse = function (err, response) {
   debug(response);
 
   if (response && response.Messages && response.Messages.length > 0) {
-    async.each(response.Messages, this._processMessageBound, function () {
+     let message = response.Messages;
+    if(!consumer.callEachBatchItem){
+      message = [response.Messages]
+    }
+    async.each(message, this._processMessageBound, function () {
       // start polling again once all of the messages have been processed
       consumer._poll();
     });
@@ -170,13 +175,21 @@ Consumer.prototype._processMessage = function (message, cb) {
 };
 
 Consumer.prototype._deleteMessage = function (message, cb) {
+  if(!Array.isArray(message)){
+    message = [message];
+  }
   var deleteParams = {
     QueueUrl: this.queueUrl,
-    ReceiptHandle: message.ReceiptHandle
+    Entries: message.map((item, i)=>{
+      return {
+        Id: i +'',
+        ReceiptHandle: item.ReceiptHandle
+      }
+    })
   };
 
   debug('Deleting message %s', message.MessageId);
-  this.sqs.deleteMessage(deleteParams, function (err) {
+  this.sqs.deleteMessageBatch(deleteParams, function (err) {
     if (err) return cb(new SQSError('SQS delete message failed: ' + err.message));
 
     cb();
