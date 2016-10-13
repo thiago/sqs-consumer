@@ -9,7 +9,6 @@ var requiredOptions = [
     'queueUrl',
     'handleMessage'
   ];
-var SQS_BATCH_LIMIT = 10;
 
 /**
  * Construct a new SQSError
@@ -28,8 +27,8 @@ function validate(options) {
     }
   });
 
-  if (options.batchSize < 1) {
-    throw new Error('SQS batchSize option must be greater than 0.');
+  if (options.batchSize > 10 || options.batchSize < 1) {
+    throw new Error('SQS batchSize option must be between 1 and 10.');
   }
 }
 
@@ -68,8 +67,8 @@ function Consumer(options) {
     region: options.region || 'eu-west-1'
   });
 
+  this._handleSqsResponseBound = this._handleSqsResponse.bind(this);
   this._processMessageBound = this._processMessage.bind(this);
-  this._deleteMessagePromiseBound = this._deleteMessagePromise.bind(this);
 }
 
 util.inherits(Consumer, EventEmitter);
@@ -100,84 +99,19 @@ Consumer.prototype.stop = function () {
   this.stopped = true;
 };
 
-Consumer.prototype._pollPromise = function (receiveParams) {
-  var consumer = this;
-  return new Promise(function(resolve, reject){
-    consumer.sqs.receiveMessage(receiveParams, function(err, response){
-      if(err){
-        return reject(err);
-      }
-      resolve(response);
-    });
-  });
-};
-
-Consumer.prototype._paginatedPoll = function (receiveParams, remaining) {
-  var consumer = this;
-  var response;
-  if(remaining === null || remaining === undefined){
-    remaining = 0;
-  }
-
-  return consumer._pollPromise(receiveParams)
-    .then(function(_response){
-      response = _response;
-      remaining = remaining - receiveParams.MaxNumberOfMessages;
-      if (!(_response && _response.Messages && _response.Messages.length === SQS_BATCH_LIMIT && consumer.batchSize > SQS_BATCH_LIMIT)) {
-        return;
-      }
-      if(remaining < 1){
-        return;
-      }
-      receiveParams.WaitTimeSeconds = consumer.waitTimeSeconds;
-      receiveParams.MaxNumberOfMessages = remaining > SQS_BATCH_LIMIT ? SQS_BATCH_LIMIT : remaining;
-      return consumer._paginatedPoll(receiveParams, remaining);
-    })
-    .then(function(_response){
-      if(_response && _response.Messages && Array.isArray(_response.Messages)){
-        response.Messages = response.Messages.concat(_response.Messages);
-      }
-      return response;
-    });
-};
-
 Consumer.prototype._poll = function () {
+  var receiveParams = {
+    QueueUrl: this.queueUrl,
+    AttributeNames: this.attributeNames,
+    MessageAttributeNames: this.messageAttributeNames,
+    MaxNumberOfMessages: this.batchSize,
+    WaitTimeSeconds: this.waitTimeSeconds,
+    VisibilityTimeout: this.visibilityTimeout
+  };
 
-  var consumer = this,
-    paramsList = [],
-    remaining = this.batchSize,
-    currentMax = this.batchSize;
-
-  while (remaining > 0){
-     currentMax = remaining < SQS_BATCH_LIMIT ? remaining : SQS_BATCH_LIMIT;
-    paramsList.push(this._paginatedPoll({
-      QueueUrl: this.queueUrl,
-      AttributeNames: this.attributeNames,
-      MessageAttributeNames: this.messageAttributeNames,
-      MaxNumberOfMessages: currentMax,
-      WaitTimeSeconds: this.waitTimeSeconds,
-      VisibilityTimeout: this.visibilityTimeout
-    }, currentMax));
-    remaining = remaining - currentMax;
-  }
   if (!this.stopped) {
     debug('Polling for messages');
-    Promise.all(paramsList)
-      .then(function (responseList) {
-        debug('Polled messages');
-        var response = responseList.shift();
-        responseList.forEach(function(_response){
-          if(_response && _response.Messages){
-            response.Messages = response.Messages.concat(_response.Messages);
-          }
-        });
-        return consumer._handleSqsResponse(null, response);
-      })
-      .catch(function (err) {
-        debug('Error polling messages', err);
-        return consumer._handleSqsResponse(err);
-      });
-
+    this.sqs.receiveMessage(receiveParams, this._handleSqsResponseBound);
   } else {
     this.emit('stopped');
   }
@@ -191,17 +125,14 @@ Consumer.prototype._handleSqsResponse = function (err, response) {
   }
 
   debug('Received SQS response');
-  //debug(response);
-
-  var messages = [];
+  debug(response);
 
   if (response && response.Messages && response.Messages.length > 0) {
-    messages = response.Messages;
-    if(!consumer.callEachBatchItem) {
-      messages = [messages];
+     let message = response.Messages;
+    if(!consumer.callEachBatchItem){
+      message = [response.Messages]
     }
-
-    async.each(messages, this._processMessageBound, function () {
+    async.each(message, this._processMessageBound, function () {
       // start polling again once all of the messages have been processed
       consumer._poll();
     });
@@ -220,6 +151,7 @@ Consumer.prototype._handleSqsResponse = function (err, response) {
 
 Consumer.prototype._processMessage = function (message, cb) {
   var consumer = this;
+
   this.emit('message_received', message);
   async.series([
     function handleMessage(done) {
@@ -242,40 +174,26 @@ Consumer.prototype._processMessage = function (message, cb) {
   });
 };
 
-Consumer.prototype._deleteMessagePromise = function (deleteParams, cb) {
-  this.sqs.deleteMessageBatch(deleteParams, function (err, response) {
-      if (err) return cb(new SQSError('SQS delete message failed: ' + err.message));
-      cb(response);
-  });
-};
-
-Consumer.prototype._deleteMessage = function (_messages, cb) {
-  var consumer = this,
-    ids = [],
-    messages = [];
-  
-  if(!Array.isArray(_messages)){
-    _messages = [_messages];
+Consumer.prototype._deleteMessage = function (message, cb) {
+  if(!Array.isArray(message)){
+    message = [message];
   }
+  var deleteParams = {
+    QueueUrl: this.queueUrl,
+    Entries: message.map((item, i)=>{
+      return {
+        Id: i +'',
+        ReceiptHandle: item.ReceiptHandle
+      }
+    })
+  };
 
-  while (_messages.length > 0) {
-    messages.push(_messages.splice(0, SQS_BATCH_LIMIT));
-  }
+  debug('Deleting message %s', message.MessageId);
+  this.sqs.deleteMessageBatch(deleteParams, function (err) {
+    if (err) return cb(new SQSError('SQS delete message failed: ' + err.message));
 
-  messages = messages.map(function(group){
-    return {
-      QueueUrl: consumer.queueUrl,
-      Entries: group.map(function (item, i){
-        ids.push(item.MessageId);
-        return {
-          Id: i + '',
-          ReceiptHandle: item.ReceiptHandle
-        };
-      })
-    };
+    cb();
   });
-  debug('Deleting messages %d %s', ids.length, ids.join(', '));
-  async.each(messages, consumer._deleteMessagePromiseBound, cb);
 };
 
 module.exports = Consumer;
