@@ -21,7 +21,7 @@ describe('Consumer', function () {
     sqs = sinon.mock();
     sqs.receiveMessage = sinon.stub().yieldsAsync(null, response);
     sqs.receiveMessage.onSecondCall().returns();
-    sqs.deleteMessage = sinon.stub().yieldsAsync(null);
+    sqs.deleteMessageBatch = sinon.stub().yieldsAsync(null);
     consumer = new Consumer({
       queueUrl: 'some-queue-url',
       region: 'some-region',
@@ -105,7 +105,7 @@ describe('Consumer', function () {
       var deleteErr = new Error('Delete error');
 
       handleMessage.yields(null);
-      sqs.deleteMessage.yields(deleteErr);
+      sqs.deleteMessageBatch.yields(deleteErr);
 
       consumer.on('error', function (err) {
         assert.ok(err);
@@ -206,10 +206,10 @@ describe('Consumer', function () {
       consumer.start();
 
       consumer.on('message_processed', function () {
-        sinon.assert.calledWith(sqs.deleteMessage, {
+        sinon.assert.calledWith(sqs.deleteMessageBatch, [{
           QueueUrl: 'some-queue-url',
           ReceiptHandle: 'receipt-handle'
-        });
+        }]);
         done();
       });
     });
@@ -223,7 +223,7 @@ describe('Consumer', function () {
 
       consumer.start();
 
-      sinon.assert.notCalled(sqs.deleteMessage);
+      sinon.assert.notCalled(sqs.deleteMessageBatch);
     });
 
     it('consumes another message once one is processed', function (done) {
